@@ -27,6 +27,19 @@ class FeatureTests(unittest.TestCase):
         self.assertIn("repeated_char_ratio", featured.columns)
         self.assertTrue(bool(featured.loc[0, "variant_present_flag"]))
 
+    def test_review_features_handles_missing_optional_columns(self) -> None:
+        reviews = pd.DataFrame(
+            [
+                {
+                    "product_id": "1",
+                    "review_text": "ok",
+                }
+            ]
+        )
+        featured = build_review_features(reviews)
+        self.assertIn("variant_present_flag", featured.columns)
+        self.assertFalse(bool(featured.loc[0, "variant_present_flag"]))
+
     def test_product_aggregates_merge_product_fields(self) -> None:
         reviews = pd.DataFrame(
             [
@@ -62,6 +75,23 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(agg.loc[0, "price_band"], "mid")
         self.assertEqual(agg.loc[0, "sold_count_band"], "high")
         self.assertGreaterEqual(agg.loc[0, "duplicate_ratio"], 0)
+
+    def test_product_aggregates_keep_products_without_reviews(self) -> None:
+        reviews = pd.DataFrame(columns=["product_id", "review_text"])
+        products = pd.DataFrame(
+            [
+                {
+                    "product_id": "1",
+                    "category_breadcrumb": "elektronik",
+                    "price_display": "150000",
+                    "sold_count_display": "250",
+                }
+            ]
+        )
+        agg = build_product_aggregates(reviews, products)
+        self.assertEqual(len(agg), 1)
+        self.assertEqual(agg.loc[0, "review_count"], 0)
+        self.assertEqual(float(agg.loc[0, "review_density_proxy"]), 0.0)
 
 
 if __name__ == "__main__":
