@@ -67,7 +67,12 @@ def _load_seed_products(project_root: str | Path) -> pd.DataFrame:
     if "product_url" not in df.columns:
         raise ValueError("seed_products.csv must include a product_url column")
     df["product_url"] = df["product_url"].fillna("").astype(str).str.strip()
-    return df[df["product_url"] != ""].reset_index(drop=True)
+    valid_rows = df[df["product_url"] != ""].reset_index(drop=True)
+    if valid_rows.empty:
+        raise ValueError(
+            "seed_products.csv has no valid product_url values. Fill template rows with public product URLs first."
+        )
+    return valid_rows
 
 
 def snapshot_seed_products(

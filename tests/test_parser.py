@@ -1,10 +1,15 @@
 from pathlib import Path
+import tempfile
 import sys
 import unittest
 
+import pandas as pd
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from shopee_safe_scraper.config import DEFAULT_CONFIG, save_config
 from shopee_safe_scraper.parser import discover_review_links, parse_product_snapshot, parse_reviews_from_html
+from shopee_safe_scraper.pipeline import ensure_project_layout, snapshot_seed_products
 
 
 SAMPLE_HTML = """
@@ -90,6 +95,25 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual(links[0], "https://shopee.co.id/produk-contoh-i.123.456")
         self.assertIn("page=2", links[1])
+
+    def test_snapshot_seed_products_fails_fast_when_seed_urls_blank(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ensure_project_layout(root)
+            save_config(root / "config.yaml", DEFAULT_CONFIG)
+            pd.DataFrame(
+                [
+                    {
+                        "product_url": "",
+                        "category_quota": "Elektronik",
+                        "chosen_reason": "manual seed slot 1",
+                        "seed_date": "2026-04-24",
+                    }
+                ]
+            ).to_csv(root / "data" / "interim" / "seed_products.csv", index=False)
+
+            with self.assertRaisesRegex(ValueError, "no valid product_url values"):
+                snapshot_seed_products(root, sleep=False)
 
 
 if __name__ == "__main__":
