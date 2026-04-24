@@ -149,6 +149,7 @@ def harvest_reviews(
     limit_products: int | None = None,
     sleep: bool = True,
     max_pages_per_product: int = 5,
+    verbose: bool = False,
 ) -> dict[str, Any]:
     paths = ensure_project_layout(project_root)
     config = load_config(paths["root"] / "config.yaml")
@@ -159,9 +160,16 @@ def harvest_reviews(
     crawler = SafeCrawler(config=config, sleep=sleep)
     manifest_path = paths["logs"] / "crawl_manifest.jsonl"
     rows: list[dict[str, Any]] = []
+    product_review_counts: dict[str, int] = {}
     stop_reason: str | None = None
 
     for product_idx, seed in seeds.iterrows():
+        product_url = seed["product_url"]
+        if verbose:
+            print(
+                f"[review_harvest] product {product_idx + 1}/{len(seeds)}: "
+                f"fetch first page for {product_url}"
+            )
         first_page = crawler.fetch(seed["product_url"])
         stop_details = inspect_block_condition(
             status_code=first_page.status_code,
@@ -191,11 +199,23 @@ def harvest_reviews(
         save_text(paths["raw_html"] / f"review_page_{product_idx + 1:03d}_001.html", first_page.text)
         if stop_candidate:
             stop_reason = stop_candidate
+            if verbose:
+                print(f"[review_harvest] stop on product {product_idx + 1}: {stop_reason}")
             break
 
         page_urls = discover_review_links(first_page.text, first_page.final_url, max_pages=max_pages_per_product)
+        if verbose:
+            print(
+                f"[review_harvest] product {product_idx + 1}: "
+                f"{len(page_urls)} page(s) queued"
+            )
         parse_failures = 0
         for page_no, page_url in enumerate(page_urls, start=1):
+            if verbose:
+                print(
+                    f"[review_harvest] product {product_idx + 1}: "
+                    f"page {page_no}/{len(page_urls)}"
+                )
             page_result = first_page if page_no == 1 else crawler.fetch(page_url)
             if page_no > 1:
                 stop_details = inspect_block_condition(
@@ -226,11 +246,16 @@ def harvest_reviews(
                 save_text(paths["raw_html"] / f"review_page_{product_idx + 1:03d}_{page_no:03d}.html", page_result.text)
                 if stop_candidate:
                     stop_reason = stop_candidate
+                    if verbose:
+                        print(
+                            f"[review_harvest] stop on product {product_idx + 1} "
+                            f"page {page_no}: {stop_reason}"
+                        )
                     break
 
             parsed = parse_reviews_from_html(
                 page_result.text,
-                product_url=seed["product_url"],
+                product_url=product_url,
                 review_page=page_no,
                 source_url=page_url,
             )
@@ -239,9 +264,27 @@ def harvest_reviews(
             else:
                 parse_failures = 0
             rows.extend(parsed)
+            product_id = parsed[0]["product_id"] if parsed else None
+            if product_id:
+                product_review_counts[product_id] = product_review_counts.get(product_id, 0) + len(parsed)
+            if verbose:
+                print(
+                    f"[review_harvest] product {product_idx + 1}: "
+                    f"parsed {len(parsed)} review(s), total requests={crawler.request_count}"
+                )
             if parse_failures >= 3:
+                if verbose:
+                    print(
+                        f"[review_harvest] product {product_idx + 1}: "
+                        "stop after 3 consecutive empty parse pages"
+                    )
                 break
-            if len([row for row in rows if row["product_id"] == parsed[0]["product_id"]]) >= int(config["max_reviews_per_product"]) if parsed else False:
+            if product_id and product_review_counts.get(product_id, 0) >= int(config["max_reviews_per_product"]):
+                if verbose:
+                    print(
+                        f"[review_harvest] product {product_idx + 1}: "
+                        f"reached max_reviews_per_product={config['max_reviews_per_product']}"
+                    )
                 break
         if stop_reason:
             break
