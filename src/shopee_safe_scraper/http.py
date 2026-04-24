@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,19 @@ BLOCK_MARKERS = (
     "sign in",
 )
 
+TITLE_RE = re.compile(r"<title[^>]*>(?P<title>.*?)</title>", flags=re.IGNORECASE | re.DOTALL)
+SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", flags=re.IGNORECASE | re.DOTALL)
+COMMENT_RE = re.compile(r"<!--.*?-->", flags=re.DOTALL)
+TAG_RE = re.compile(r"<[^>]+>")
+
+
+@dataclass
+class BlockDetectionResult:
+    reason: str | None
+    signal_class: str | None = None
+    signal_source: str | None = None
+    matched_text: str | None = None
+
 
 @dataclass
 class FetchResult:
@@ -33,6 +47,83 @@ class FetchResult:
     error: str | None = None
 
 
+def _extract_title(text: str) -> str:
+    match = TITLE_RE.search(text or "")
+    if not match:
+        return ""
+    return re.sub(r"\s+", " ", match.group("title")).strip().lower()
+
+
+def _extract_visible_text(text: str) -> str:
+    without_scripts = SCRIPT_STYLE_RE.sub(" ", text or "")
+    without_comments = COMMENT_RE.sub(" ", without_scripts)
+    without_tags = TAG_RE.sub(" ", without_comments)
+    return re.sub(r"\s+", " ", without_tags).strip().lower()
+
+
+def inspect_block_condition(
+    status_code: int,
+    text: str,
+    final_url: str,
+    stop_on_status: list[int],
+    stop_on_keywords: list[str] | None = None,
+) -> BlockDetectionResult:
+    if status_code in stop_on_status:
+        return BlockDetectionResult(
+            reason=f"status_{status_code}",
+            signal_class="status_code",
+            signal_source="http_status",
+            matched_text=str(status_code),
+        )
+
+    if not (text or "").strip():
+        return BlockDetectionResult(
+            reason="empty_payload",
+            signal_class="payload",
+            signal_source="body",
+        )
+
+    final_lower = (final_url or "").lower()
+    if "login" in final_lower or "signin" in final_lower:
+        return BlockDetectionResult(
+            reason="forced_login_redirect",
+            signal_class="redirect",
+            signal_source="final_url",
+            matched_text=final_url,
+        )
+
+    markers = [marker.lower().strip() for marker in (stop_on_keywords or list(BLOCK_MARKERS)) if marker.strip()]
+    title_text = _extract_title(text)
+    visible_text = _extract_visible_text(text)
+
+    for marker in markers:
+        if marker in {"login", "sign in"}:
+            if marker in title_text:
+                return BlockDetectionResult(
+                    reason=f"keyword_{marker}",
+                    signal_class="keyword",
+                    signal_source="title",
+                    matched_text=marker,
+                )
+            continue
+        if marker in title_text:
+            return BlockDetectionResult(
+                reason=f"keyword_{marker}",
+                signal_class="keyword",
+                signal_source="title",
+                matched_text=marker,
+            )
+        if marker in visible_text:
+            return BlockDetectionResult(
+                reason=f"keyword_{marker}",
+                signal_class="keyword",
+                signal_source="visible_text",
+                matched_text=marker,
+            )
+
+    return BlockDetectionResult(reason=None)
+
+
 def detect_block_condition(
     status_code: int,
     text: str,
@@ -40,19 +131,13 @@ def detect_block_condition(
     stop_on_status: list[int],
     stop_on_keywords: list[str] | None = None,
 ) -> str | None:
-    if status_code in stop_on_status:
-        return f"status_{status_code}"
-    text_lower = (text or "").lower()
-    markers = stop_on_keywords or list(BLOCK_MARKERS)
-    for marker in markers:
-        if marker.lower() in text_lower:
-            return f"keyword_{marker.lower()}"
-    final_lower = (final_url or "").lower()
-    if "login" in final_lower or "signin" in final_lower:
-        return "forced_login_redirect"
-    if not text.strip():
-        return "empty_payload"
-    return None
+    return inspect_block_condition(
+        status_code=status_code,
+        text=text,
+        final_url=final_url,
+        stop_on_status=stop_on_status,
+        stop_on_keywords=stop_on_keywords,
+    ).reason
 
 
 class SafeCrawler:

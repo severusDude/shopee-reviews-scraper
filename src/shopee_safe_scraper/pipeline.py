@@ -9,7 +9,7 @@ import pandas as pd
 
 from .cleaning import clean_products_df, clean_reviews_df, export_dataframe
 from .config import load_config
-from .http import SafeCrawler, append_jsonl, detect_block_condition, save_text, write_json
+from .http import SafeCrawler, append_jsonl, inspect_block_condition, save_text, write_json
 from .parser import discover_review_links, parse_product_snapshot, parse_reviews_from_html, utcnow_iso
 from .features import build_product_aggregates, build_review_features
 
@@ -94,13 +94,14 @@ def snapshot_seed_products(
     for row_idx, row in seeds.iterrows():
         url = row["product_url"]
         result = crawler.fetch(url)
-        stop_candidate = detect_block_condition(
+        stop_details = inspect_block_condition(
             status_code=result.status_code,
             text=result.text,
             final_url=result.final_url,
             stop_on_status=config["stop_on_status"],
             stop_on_keywords=config["stop_on_keywords"],
         )
+        stop_candidate = stop_details.reason
         save_text(paths["raw_html"] / f"product_snapshot_{row_idx + 1:03d}.html", result.text)
         manifest_row = {
             "stage": "product_snapshot",
@@ -111,6 +112,9 @@ def snapshot_seed_products(
             "size_bytes": result.size_bytes,
             "error": result.error,
             "stop_reason": stop_candidate,
+            "stop_signal_class": stop_details.signal_class,
+            "stop_signal_source": stop_details.signal_source,
+            "stop_matched_text": stop_details.matched_text,
             "scrape_time": utcnow_iso(),
         }
         append_jsonl(manifest_path, manifest_row)
@@ -159,13 +163,14 @@ def harvest_reviews(
 
     for product_idx, seed in seeds.iterrows():
         first_page = crawler.fetch(seed["product_url"])
-        stop_candidate = detect_block_condition(
+        stop_details = inspect_block_condition(
             status_code=first_page.status_code,
             text=first_page.text,
             final_url=first_page.final_url,
             stop_on_status=config["stop_on_status"],
             stop_on_keywords=config["stop_on_keywords"],
         )
+        stop_candidate = stop_details.reason
         append_jsonl(
             manifest_path,
             {
@@ -177,6 +182,9 @@ def harvest_reviews(
                 "size_bytes": first_page.size_bytes,
                 "error": first_page.error,
                 "stop_reason": stop_candidate,
+                "stop_signal_class": stop_details.signal_class,
+                "stop_signal_source": stop_details.signal_source,
+                "stop_matched_text": stop_details.matched_text,
                 "scrape_time": utcnow_iso(),
             },
         )
@@ -190,13 +198,14 @@ def harvest_reviews(
         for page_no, page_url in enumerate(page_urls, start=1):
             page_result = first_page if page_no == 1 else crawler.fetch(page_url)
             if page_no > 1:
-                stop_candidate = detect_block_condition(
+                stop_details = inspect_block_condition(
                     status_code=page_result.status_code,
                     text=page_result.text,
                     final_url=page_result.final_url,
                     stop_on_status=config["stop_on_status"],
                     stop_on_keywords=config["stop_on_keywords"],
                 )
+                stop_candidate = stop_details.reason
                 append_jsonl(
                     manifest_path,
                     {
@@ -208,6 +217,9 @@ def harvest_reviews(
                         "size_bytes": page_result.size_bytes,
                         "error": page_result.error,
                         "stop_reason": stop_candidate,
+                        "stop_signal_class": stop_details.signal_class,
+                        "stop_signal_source": stop_details.signal_source,
+                        "stop_matched_text": stop_details.matched_text,
                         "scrape_time": utcnow_iso(),
                     },
                 )
