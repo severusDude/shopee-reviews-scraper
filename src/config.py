@@ -39,12 +39,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ),
     "public_only": True,
     "single_thread_only": True,
+    "logging": {
+        "enabled": True,
+        "level": "INFO",
+        "console": True,
+        "file": True,
+        "event_jsonl": True,
+        "verbose_notebook_events": True,
+    },
+    "progress": {
+        "enabled": True,
+        "style": "notebook",
+    },
 }
 
 
 def _merged_with_defaults(payload: dict[str, Any]) -> dict[str, Any]:
     merged = deepcopy(DEFAULT_CONFIG)
-    merged.update(payload)
+    for key, value in payload.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key].update(value)
+        else:
+            merged[key] = value
     return merged
 
 

@@ -9,4 +9,6 @@ dependencies = [
     "jupyter>=1.1",
     "pandas>=2.2",
     "pyarrow>=17.0",
+    "tqdm>=4.67",
+    "pandas>=3.0.2"
 ]

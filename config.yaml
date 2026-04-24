@@ -30,5 +30,17 @@
   ],
   "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
   "public_only": true,
-  "single_thread_only": true
+  "single_thread_only": true,
+  "logging": {
+    "enabled": true,
+    "level": "INFO",
+    "console": true,
+    "file": true,
+    "event_jsonl": true,
+    "verbose_notebook_events": true
+  },
+  "progress": {
+    "enabled": true,
+    "style": "notebook"
+  }
 }
