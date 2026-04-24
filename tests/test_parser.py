@@ -2,6 +2,7 @@ from pathlib import Path
 import shutil
 import sys
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -9,7 +10,14 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from config import DEFAULT_CONFIG, save_config
-from parser import discover_review_links, parse_product_snapshot, parse_reviews_from_html
+from parser import (
+    detect_shell_page,
+    discover_review_links,
+    parse_product_snapshot,
+    parse_reviews_from_html,
+    parse_reviews_from_payload,
+    parse_reviews_from_rendered_html,
+)
 from pipeline import ensure_project_layout, harvest_reviews, snapshot_seed_products
 
 
@@ -68,6 +76,46 @@ SAMPLE_HTML = """
 </html>
 """
 
+SHELL_HTML = (Path(__file__).resolve().parents[1] / "data" / "raw" / "html" / "review_page_001_001.html").read_text(encoding="utf-8")
+
+SAMPLE_PAYLOAD = {
+    "data": {
+        "ratings": [
+            {
+                "comment": "Barang mantap",
+                "rating_star": 5,
+                "ctime": "2026-04-03",
+                "variation": "Hitam",
+                "author": "Sinta",
+                "images": ["a.jpg"],
+                "seller_reply": {"comment": "Terima kasih"},
+            },
+            {
+                "comment_text": "Sesuai foto",
+                "rating": 4,
+                "created_at": "2026-04-04",
+                "variant": "Putih",
+                "username": "Budi",
+            },
+        ]
+    }
+}
+
+RENDERED_REVIEW_HTML = """
+<html>
+  <body>
+    <div class="review-card">
+      5 star Barang bagus sekali 2026-04-05 variasi: Hitam 3 helpful
+      <img src="a.jpg" />
+      <div>Balasan penjual</div>
+    </div>
+    <div class="rating-card">
+      4/5 Sesuai deskripsi 2026-04-06 variant: Putih
+    </div>
+  </body>
+</html>
+"""
+
 
 class WorkspaceTempDir:
     def __enter__(self) -> Path:
@@ -110,6 +158,38 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual(links[0], "https://shopee.co.id/produk-contoh-i.123.456")
         self.assertIn("page=2", links[1])
+
+    def test_detect_shell_page_flags_saved_shell_html(self) -> None:
+        shell_details = detect_shell_page(
+            SHELL_HTML,
+            review_rows=parse_reviews_from_html(
+                SHELL_HTML,
+                product_url="https://shopee.co.id/contoh-i.1.2",
+            ),
+            product_record=parse_product_snapshot(
+                SHELL_HTML,
+                product_url="https://shopee.co.id/contoh-i.1.2",
+            ),
+        )
+        self.assertEqual(shell_details.reason, "shell_page_no_embedded_reviews")
+
+    def test_parse_reviews_from_payload_extracts_rows(self) -> None:
+        reviews = parse_reviews_from_payload(
+            SAMPLE_PAYLOAD,
+            product_url="https://shopee.co.id/produk-contoh-i.123.456",
+        )
+        self.assertEqual(len(reviews), 2)
+        self.assertTrue(bool(reviews[0]["media_flag"]))
+        self.assertTrue(bool(reviews[0]["seller_reply_flag"]))
+
+    def test_parse_reviews_from_rendered_html_extracts_rows(self) -> None:
+        reviews = parse_reviews_from_rendered_html(
+            RENDERED_REVIEW_HTML,
+            product_url="https://shopee.co.id/produk-contoh-i.123.456",
+        )
+        self.assertEqual(len(reviews), 2)
+        self.assertEqual(str(reviews[0]["star_rating"]), "5")
+        self.assertTrue(bool(reviews[0]["seller_reply_flag"]))
 
     def test_snapshot_seed_products_fails_fast_when_seed_urls_blank(self) -> None:
         with WorkspaceTempDir() as root:
@@ -215,6 +295,137 @@ class ParserTests(unittest.TestCase):
             self.assertFalse(mock_print.called)
             self.assertIn("log_path", result)
             self.assertTrue(Path(result["event_log_path"]).exists())
+
+    def test_harvest_reviews_uses_browser_fallback_on_shell_page(self) -> None:
+        class FakeCrawler:
+            def __init__(self, config: dict[str, object], sleep: bool = True):
+                self.config = config
+                self.sleep = sleep
+                self.request_count = 0
+
+            def fetch(self, url: str):
+                self.request_count += 1
+                return type(
+                    "FetchResult",
+                    (),
+                    {
+                        "status_code": 200,
+                        "text": SHELL_HTML,
+                        "final_url": url,
+                        "elapsed_s": 0.1,
+                        "size_bytes": len(SHELL_HTML.encode("utf-8")),
+                        "error": None,
+                    },
+                )()
+
+        browser_rows = parse_reviews_from_payload(
+            SAMPLE_PAYLOAD,
+            product_url="https://shopee.co.id/produk-contoh-i.123.456",
+        )
+
+        browser_result = type(
+            "BrowserResult",
+            (),
+            {
+                "rows": browser_rows,
+                "payload_pages": [
+                    {
+                        "page_no": 1,
+                        "source_url": "https://shopee.co.id/api/v4/item/get_ratings",
+                        "payload": SAMPLE_PAYLOAD,
+                        "rows": browser_rows,
+                    }
+                ],
+                "artifacts": [
+                    {
+                        "kind": "payload_json",
+                        "page_no": "1",
+                        "source_url": "https://shopee.co.id/api/v4/item/get_ratings",
+                        "content": SAMPLE_PAYLOAD,
+                    }
+                ],
+                "error": None,
+            },
+        )()
+
+        with WorkspaceTempDir() as root:
+            ensure_project_layout(root)
+            save_config(root / "config.yaml", DEFAULT_CONFIG)
+            pd.DataFrame(
+                [
+                    {
+                        "product_url": "https://shopee.co.id/produk-contoh-i.123.456",
+                        "category_quota": "Elektronik",
+                        "chosen_reason": "manual seed slot 1",
+                        "seed_date": "2026-04-24",
+                    }
+                ]
+            ).to_csv(root / "data" / "interim" / "seed_products.csv", index=False)
+
+            with patch("pipeline.SafeCrawler", FakeCrawler):
+                with patch("pipeline.fetch_reviews_with_browser_fallback", return_value=browser_result):
+                    result = harvest_reviews(root, sleep=False, max_pages_per_product=2, verbose=True)
+
+            self.assertEqual(len(result["reviews"]), 2)
+            event_text = Path(result["event_log_path"]).read_text(encoding="utf-8")
+            self.assertIn('"event": "shell_page_detected"', event_text)
+            self.assertIn('"event": "browser_fallback_started"', event_text)
+            self.assertIn('"event": "browser_payload_captured"', event_text)
+
+    def test_harvest_reviews_logs_browser_fallback_failure(self) -> None:
+        class FakeCrawler:
+            def __init__(self, config: dict[str, object], sleep: bool = True):
+                self.config = config
+                self.sleep = sleep
+                self.request_count = 0
+
+            def fetch(self, url: str):
+                self.request_count += 1
+                return type(
+                    "FetchResult",
+                    (),
+                    {
+                        "status_code": 200,
+                        "text": SHELL_HTML,
+                        "final_url": url,
+                        "elapsed_s": 0.1,
+                        "size_bytes": len(SHELL_HTML.encode("utf-8")),
+                        "error": None,
+                    },
+                )()
+
+        browser_result = type(
+            "BrowserResult",
+            (),
+            {
+                "rows": [],
+                "payload_pages": [],
+                "artifacts": [],
+                "error": "playwright_import_error: missing",
+            },
+        )()
+
+        with WorkspaceTempDir() as root:
+            ensure_project_layout(root)
+            save_config(root / "config.yaml", DEFAULT_CONFIG)
+            pd.DataFrame(
+                [
+                    {
+                        "product_url": "https://shopee.co.id/produk-contoh-i.123.456",
+                        "category_quota": "Elektronik",
+                        "chosen_reason": "manual seed slot 1",
+                        "seed_date": "2026-04-24",
+                    }
+                ]
+            ).to_csv(root / "data" / "interim" / "seed_products.csv", index=False)
+
+            with patch("pipeline.SafeCrawler", FakeCrawler):
+                with patch("pipeline.fetch_reviews_with_browser_fallback", return_value=browser_result):
+                    result = harvest_reviews(root, sleep=False, max_pages_per_product=2, verbose=True)
+
+            self.assertEqual(len(result["reviews"]), 0)
+            event_text = Path(result["event_log_path"]).read_text(encoding="utf-8")
+            self.assertIn('"event": "browser_fallback_failed"', event_text)
 
 
 if __name__ == "__main__":

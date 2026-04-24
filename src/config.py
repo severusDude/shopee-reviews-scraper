@@ -24,6 +24,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cooldown_max_s": 120,
     "max_requests_per_run": 150,
     "timeout_s": 30,
+    "browser_fallback_enabled": True,
+    "browser_engine": "chromium",
+    "browser_timeout_s": 30,
+    "browser_headless": True,
     "stop_on_status": [403, 429],
     "stop_on_keywords": [
         "captcha",

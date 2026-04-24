@@ -42,3 +42,10 @@ Jupyter-first scaffold for collecting a small, public-only Shopee review corpus 
 ## Dependency note
 
 Core code is mostly stdlib + `pandas`, but parquet export needs either `pyarrow` or `fastparquet`. The cleaning notebook writes CSV fallbacks if parquet support is missing and reports that in its summary.
+
+Review harvest now includes optional browser fallback for Shopee shell pages. Install Playwright browser runtime before real harvest runs:
+
+- `uv add playwright`
+- `uv run playwright install chromium`
+
+Browser fallback still follows public-only rules: no login, no proxy rotation, no captcha solving, no hidden/private endpoint probing.

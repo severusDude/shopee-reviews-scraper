@@ -5,6 +5,7 @@ import json
 import re
 from datetime import datetime, timezone
 from html import unescape
+from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import parse_qs, urlparse
 
@@ -27,6 +28,12 @@ META_RE = re.compile(
 )
 TITLE_RE = re.compile(r"<title>(.*?)</title>", flags=re.IGNORECASE | re.DOTALL)
 HREF_RE = re.compile(r'href=["\']([^"\']+)["\']', flags=re.IGNORECASE)
+BODY_RE = re.compile(r"<body[^>]*>(?P<body>.*?)</body>", flags=re.IGNORECASE | re.DOTALL)
+REVIEW_CARD_RE = re.compile(
+    r"<div[^>]+(?:class|data-testid)=['\"][^'\"]*(?:review|rating)[^'\"]*['\"][^>]*>(?P<body>.*?)</div>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+STAR_RE = re.compile(r"([1-5])(?:\s*/\s*5|\s*bintang|\s*star)", flags=re.IGNORECASE)
 
 
 PRODUCT_KEYS = {
@@ -63,6 +70,16 @@ REVIEW_CONTAINER_HINTS = {
 }
 
 
+@dataclass(frozen=True)
+class ShellPageDetectionResult:
+    reason: str | None
+    signal_count: int
+    visible_text_length: int
+    blob_count: int
+    review_candidate_count: int
+    product_signal_count: int
+
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -74,6 +91,11 @@ def stable_hash(text: str) -> str:
 def strip_tags(text: str) -> str:
     no_tags = re.sub(r"<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", unescape(no_tags)).strip()
+
+
+def extract_visible_text(html: str) -> str:
+    text = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html or "", flags=re.IGNORECASE | re.DOTALL)
+    return strip_tags(text)
 
 
 def extract_json_blobs(html: str) -> list[Any]:
@@ -99,6 +121,52 @@ def extract_json_blobs(html: str) -> list[Any]:
             except json.JSONDecodeError:
                 continue
     return blobs
+
+
+def _count_review_candidates(payload: Any) -> int:
+    return sum(1 for _ in _iter_review_candidates(payload))
+
+
+def detect_shell_page(
+    html: str,
+    *,
+    review_rows: list[dict[str, Any]] | None = None,
+    product_record: dict[str, Any] | None = None,
+) -> ShellPageDetectionResult:
+    body_match = BODY_RE.search(html or "")
+    body_html = body_match.group("body") if body_match else (html or "")
+    visible_text = extract_visible_text(body_html)
+    blobs = extract_json_blobs(html)
+    review_candidate_count = sum(_count_review_candidates(blob) for blob in blobs)
+    product_signals = 0
+    if product_record:
+        for key in ("title", "price_display", "rating_avg_display", "shop_name", "product_description"):
+            if product_record.get(key):
+                product_signals += 1
+
+    signals = 0
+    if 'id="main"' in html or "id='main'" in html:
+        signals += 1
+    if "text/shopee-page-manifest" in html or "window.__ASSETS__" in html:
+        signals += 1
+    if len(visible_text) < 400:
+        signals += 1
+    if not review_rows:
+        signals += 1
+    if review_candidate_count == 0:
+        signals += 1
+    if product_signals <= 1:
+        signals += 1
+
+    reason = "shell_page_no_embedded_reviews" if signals >= 4 else None
+    return ShellPageDetectionResult(
+        reason=reason,
+        signal_count=signals,
+        visible_text_length=len(visible_text),
+        blob_count=len(blobs),
+        review_candidate_count=review_candidate_count,
+        product_signal_count=product_signals,
+    )
 
 
 def deep_find_values(payload: Any, keys: set[str]) -> list[Any]:
@@ -280,85 +348,80 @@ def _coerce_bool(value: Any) -> bool:
     return True
 
 
-def parse_reviews_from_html(
-    html: str,
-    product_url: str,
-    review_page: int = 1,
-    scrape_time: str | None = None,
-    source_url: str | None = None,
-) -> list[dict[str, Any]]:
-    scrape_time = scrape_time or utcnow_iso()
-    product_id = extract_product_id(product_url)
-    blobs = extract_json_blobs(html)
-    reviews: list[dict[str, Any]] = []
-    source_url = source_url or product_url
+def _normalize_review_candidate(
+    candidate: dict[str, Any],
+    *,
+    product_id: str,
+    review_page: int,
+    scrape_time: str,
+    source_url: str,
+    response_hash: str,
+) -> dict[str, Any] | None:
+    text = first_scalar(
+        candidate.get(key)
+        for key in (
+            "comment",
+            "comment_text",
+            "content",
+            "review_text",
+            "review",
+            "text",
+            "message",
+        )
+    )
+    if not text:
+        return None
 
-    for candidate in _iter_review_candidates(blobs):
-        text = first_scalar(
-            candidate.get(key)
-            for key in (
-                "comment",
-                "comment_text",
-                "content",
-                "review_text",
-                "review",
-                "text",
-                "message",
-            )
-        )
-        if not text:
-            continue
+    star_value = first_scalar(
+        candidate.get(key)
+        for key in ("rating_star", "rating", "score", "star")
+    )
+    review_time = first_scalar(
+        candidate.get(key)
+        for key in ("ctime", "created_at", "time", "date", "mtime")
+    )
+    variant = first_scalar(
+        candidate.get(key)
+        for key in ("variation", "variant", "model_name", "purchase_variant")
+    )
+    reviewer = first_scalar(
+        candidate.get(key)
+        for key in ("author", "username", "buyer_username", "user_name")
+    )
+    helpful = first_scalar(
+        candidate.get(key)
+        for key in ("helpful_count", "liked_count", "upvote_count")
+    )
 
-        star_value = first_scalar(
-            candidate.get(key)
-            for key in ("rating_star", "rating", "score", "star")
-        )
-        review_time = first_scalar(
-            candidate.get(key)
-            for key in ("ctime", "created_at", "time", "date", "mtime")
-        )
-        variant = first_scalar(
-            candidate.get(key)
-            for key in ("variation", "variant", "model_name", "purchase_variant")
-        )
-        reviewer = first_scalar(
-            candidate.get(key)
-            for key in ("author", "username", "buyer_username", "user_name")
-        )
-        helpful = first_scalar(
-            candidate.get(key)
-            for key in ("helpful_count", "liked_count", "upvote_count")
-        )
+    reply_present = _coerce_bool(
+        candidate.get("seller_reply")
+        or candidate.get("reply")
+        or candidate.get("shop_reply")
+    )
+    images = candidate.get("images") or candidate.get("image_urls") or []
+    videos = candidate.get("videos") or candidate.get("video_info_list") or []
 
-        reply_present = _coerce_bool(
-            candidate.get("seller_reply")
-            or candidate.get("reply")
-            or candidate.get("shop_reply")
-        )
-        images = candidate.get("images") or candidate.get("image_urls") or []
-        videos = candidate.get("videos") or candidate.get("video_info_list") or []
+    return {
+        "product_id": product_id,
+        "review_page": review_page,
+        "scrape_time": scrape_time,
+        "review_text": str(text).strip(),
+        "star_rating": star_value,
+        "review_time_display": review_time,
+        "variant_text": variant,
+        "media_flag": bool(images or videos),
+        "seller_reply_flag": reply_present,
+        "reviewer_name_masked": reviewer,
+        "helpful_count_display": helpful,
+        "purchase_variant": variant,
+        "image_count": len(images) if isinstance(images, list) else 0,
+        "video_flag": bool(videos),
+        "response_hash": response_hash,
+        "source_url": source_url,
+    }
 
-        reviews.append(
-            {
-                "product_id": product_id,
-                "review_page": review_page,
-                "scrape_time": scrape_time,
-                "review_text": str(text).strip(),
-                "star_rating": star_value,
-                "review_time_display": review_time,
-                "variant_text": variant,
-                "media_flag": bool(images or videos),
-                "seller_reply_flag": reply_present,
-                "reviewer_name_masked": reviewer,
-                "helpful_count_display": helpful,
-                "purchase_variant": variant,
-                "image_count": len(images) if isinstance(images, list) else 0,
-                "video_flag": bool(videos),
-                "response_hash": stable_hash(html),
-                "source_url": source_url,
-            }
-        )
 
+def _dedupe_reviews(reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
     deduped: list[dict[str, Any]] = []
     seen: set[str] = set()
     for row in reviews:
@@ -378,6 +441,112 @@ def parse_reviews_from_html(
         seen.add(key)
         deduped.append(row)
     return deduped
+
+
+def parse_reviews_from_html(
+    html: str,
+    product_url: str,
+    review_page: int = 1,
+    scrape_time: str | None = None,
+    source_url: str | None = None,
+) -> list[dict[str, Any]]:
+    scrape_time = scrape_time or utcnow_iso()
+    product_id = extract_product_id(product_url)
+    blobs = extract_json_blobs(html)
+    reviews: list[dict[str, Any]] = []
+    source_url = source_url or product_url
+    response_hash = stable_hash(html)
+
+    for candidate in _iter_review_candidates(blobs):
+        row = _normalize_review_candidate(
+            candidate,
+            product_id=product_id,
+            review_page=review_page,
+            scrape_time=scrape_time,
+            source_url=source_url,
+            response_hash=response_hash,
+        )
+        if row is not None:
+            reviews.append(row)
+
+    return _dedupe_reviews(reviews)
+
+
+def parse_reviews_from_payload(
+    payload: Any,
+    *,
+    product_url: str,
+    review_page: int = 1,
+    scrape_time: str | None = None,
+    source_url: str | None = None,
+    response_hash: str | None = None,
+) -> list[dict[str, Any]]:
+    scrape_time = scrape_time or utcnow_iso()
+    product_id = extract_product_id(product_url)
+    source_url = source_url or product_url
+    response_hash = response_hash or stable_hash(json.dumps(payload, sort_keys=True, ensure_ascii=False))
+    reviews: list[dict[str, Any]] = []
+
+    for candidate in _iter_review_candidates(payload):
+        row = _normalize_review_candidate(
+            candidate,
+            product_id=product_id,
+            review_page=review_page,
+            scrape_time=scrape_time,
+            source_url=source_url,
+            response_hash=response_hash,
+        )
+        if row is not None:
+            reviews.append(row)
+
+    return _dedupe_reviews(reviews)
+
+
+def parse_reviews_from_rendered_html(
+    html: str,
+    *,
+    product_url: str,
+    review_page: int = 1,
+    scrape_time: str | None = None,
+    source_url: str | None = None,
+) -> list[dict[str, Any]]:
+    scrape_time = scrape_time or utcnow_iso()
+    source_url = source_url or product_url
+    product_id = extract_product_id(product_url)
+    response_hash = stable_hash(html)
+    reviews: list[dict[str, Any]] = []
+
+    for match in REVIEW_CARD_RE.finditer(html):
+        block = match.group("body")
+        text = strip_tags(block)
+        if len(text) < 8:
+            continue
+        star_match = STAR_RE.search(text)
+        variant_match = re.search(r"(variasi|variant)[:\s]+([^\n|]+)", text, flags=re.IGNORECASE)
+        time_match = re.search(r"(\d{4}-\d{2}-\d{2}|\d{1,2}\s+\w+\s+\d{4})", text, flags=re.IGNORECASE)
+        helpful_match = re.search(r"(\d+)\s*(orang|helpful|terbantu|like)", text, flags=re.IGNORECASE)
+        candidate = {
+            "comment": text,
+            "rating_star": star_match.group(1) if star_match else None,
+            "time": time_match.group(1) if time_match else None,
+            "variation": variant_match.group(2).strip() if variant_match else None,
+            "liked_count": helpful_match.group(1) if helpful_match else None,
+            "images": re.findall(r"<img\b", block, flags=re.IGNORECASE),
+            "videos": re.findall(r"<video\b", block, flags=re.IGNORECASE),
+            "seller_reply": bool(re.search(r"balasan penjual|seller reply|shop reply", block, flags=re.IGNORECASE)),
+        }
+        row = _normalize_review_candidate(
+            candidate,
+            product_id=product_id,
+            review_page=review_page,
+            scrape_time=scrape_time,
+            source_url=source_url,
+            response_hash=response_hash,
+        )
+        if row is not None:
+            reviews.append(row)
+
+    return _dedupe_reviews(reviews)
 
 
 def discover_review_links(html: str, base_url: str, max_pages: int = 10) -> list[str]:

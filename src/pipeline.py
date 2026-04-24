@@ -8,8 +8,15 @@ import pandas as pd
 
 from cleaning import clean_products_df, clean_reviews_df, export_dataframe
 from config import load_config
-from safe_http import SafeCrawler, append_jsonl, inspect_block_condition, save_text, write_json
-from parser import discover_review_links, parse_product_snapshot, parse_reviews_from_html, utcnow_iso
+from safe_http import (
+    SafeCrawler,
+    append_jsonl,
+    fetch_reviews_with_browser_fallback,
+    inspect_block_condition,
+    save_text,
+    write_json,
+)
+from parser import detect_shell_page, discover_review_links, parse_product_snapshot, parse_reviews_from_html, utcnow_iso
 from features import build_product_aggregates, build_review_features
 from workflow_logging import WorkflowLogger, build_workflow_logger
 
@@ -45,6 +52,25 @@ def _progress_iter(
     if logger is None:
         return iterable
     return logger.progress(iterable, desc=desc, total=total, leave=leave)
+
+
+def _save_browser_artifact(paths: dict[str, Path], product_idx: int, artifact_idx: int, artifact: dict[str, str | dict[str, Any]]) -> None:
+    kind = str(artifact.get("kind") or "artifact")
+    page_no = str(artifact.get("page_no") or "1")
+    source_url = str(artifact.get("source_url") or "")
+    if kind == "payload_json":
+        write_json(
+            paths["raw_html"] / f"review_page_{product_idx + 1:03d}_{int(page_no):03d}_browser_payload.json",
+            {
+                "source_url": source_url,
+                "payload": artifact.get("content"),
+            },
+        )
+        return
+    save_text(
+        paths["raw_html"] / f"review_page_{product_idx + 1:03d}_{artifact_idx:03d}_browser_{kind}.html",
+        str(artifact.get("content") or ""),
+    )
 
 
 def project_root_from_cwd(cwd: str | Path) -> Path:
@@ -339,6 +365,98 @@ def harvest_reviews(
                 )
                 break
 
+            first_page_reviews = parse_reviews_from_html(
+                first_page.text,
+                product_url=product_url,
+                review_page=1,
+                source_url=first_page.final_url,
+            )
+            shell_details = detect_shell_page(
+                first_page.text,
+                review_rows=first_page_reviews,
+                product_record=parse_product_snapshot(first_page.text, product_url=product_url),
+            )
+            if shell_details.reason and bool(config.get("browser_fallback_enabled", True)):
+                _log_event(
+                    logger,
+                    "event",
+                    "review_harvest",
+                    "shell_page_detected",
+                    product_index=product_idx + 1,
+                    source_url=product_url,
+                    reason=shell_details.reason,
+                    signal_count=shell_details.signal_count,
+                    visible_text_length=shell_details.visible_text_length,
+                    blob_count=shell_details.blob_count,
+                    review_candidate_count=shell_details.review_candidate_count,
+                )
+                _log_event(
+                    logger,
+                    "event",
+                    "review_harvest",
+                    "browser_fallback_started",
+                    product_index=product_idx + 1,
+                    source_url=product_url,
+                    max_pages=max_pages_per_product,
+                )
+                browser_result = fetch_reviews_with_browser_fallback(
+                    product_url=product_url,
+                    config=config,
+                    max_pages=max_pages_per_product,
+                )
+                if browser_result.error:
+                    _log_event(
+                        logger,
+                        "warning",
+                        "review_harvest",
+                        "browser_fallback_failed",
+                        product_index=product_idx + 1,
+                        source_url=product_url,
+                        error=browser_result.error,
+                    )
+                else:
+                    for page_info in browser_result.payload_pages:
+                        _log_event(
+                            logger,
+                            "event",
+                            "review_harvest",
+                            "browser_payload_captured",
+                            product_index=product_idx + 1,
+                            page_no=page_info["page_no"],
+                            source_url=page_info["source_url"],
+                            parsed_count=len(page_info["rows"]),
+                        )
+                    if browser_result.artifacts and not browser_result.payload_pages:
+                        _log_event(
+                            logger,
+                            "event",
+                            "review_harvest",
+                            "browser_dom_fallback_used",
+                            product_index=product_idx + 1,
+                            source_url=product_url,
+                            parsed_count=len(browser_result.rows),
+                        )
+                    for artifact_idx, artifact in enumerate(browser_result.artifacts, start=1):
+                        _save_browser_artifact(paths, product_idx, artifact_idx, artifact)
+                    rows.extend(browser_result.rows)
+                    if browser_result.rows:
+                        product_id = browser_result.rows[0]["product_id"]
+                        product_review_counts[product_id] = product_review_counts.get(product_id, 0) + len(browser_result.rows)
+                    _log_event(
+                        logger,
+                        "parse_result",
+                        "review_harvest",
+                        product_index=product_idx + 1,
+                        page_no=1,
+                        parsed_count=len(browser_result.rows),
+                        parse_failures=0 if browser_result.rows else 1,
+                        product_id=browser_result.rows[0]["product_id"] if browser_result.rows else None,
+                        request_count=crawler.request_count,
+                        rows_written=len(rows),
+                    )
+                    if browser_result.rows:
+                        continue
+
             page_urls = discover_review_links(first_page.text, first_page.final_url, max_pages=max_pages_per_product)
             if verbose:
                 _log_event(
@@ -422,7 +540,7 @@ def harvest_reviews(
                             )
                             break
 
-                    parsed = parse_reviews_from_html(
+                    parsed = first_page_reviews if page_no == 1 else parse_reviews_from_html(
                         page_result.text,
                         product_url=product_url,
                         review_page=page_no,

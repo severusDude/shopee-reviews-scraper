@@ -47,6 +47,14 @@ class FetchResult:
     error: str | None = None
 
 
+@dataclass
+class BrowserReviewFallbackResult:
+    rows: list[dict[str, Any]]
+    payload_pages: list[dict[str, Any]]
+    artifacts: list[dict[str, str]]
+    error: str | None = None
+
+
 def _extract_title(text: str) -> str:
     match = TITLE_RE.search(text or "")
     if not match:
@@ -253,3 +261,141 @@ def absolutize_links(base_url: str, links: list[str]) -> list[str]:
             deduped.append(absolute)
             seen.add(absolute)
     return deduped
+
+
+def fetch_reviews_with_browser_fallback(
+    *,
+    product_url: str,
+    config: dict[str, Any],
+    max_pages: int,
+) -> BrowserReviewFallbackResult:
+    from parser import parse_reviews_from_payload, parse_reviews_from_rendered_html
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:  # pragma: no cover - depends on optional dependency
+        return BrowserReviewFallbackResult(
+            rows=[],
+            payload_pages=[],
+            artifacts=[],
+            error=f"playwright_import_error: {exc}",
+        )
+
+    rows: list[dict[str, Any]] = []
+    payload_pages: list[dict[str, Any]] = []
+    artifacts: list[dict[str, str]] = []
+    browser = None
+    playwright = None
+
+    def maybe_capture_payload(response: Any) -> None:
+        resource_type = ""
+        try:
+            resource_type = response.request.resource_type
+        except Exception:
+            resource_type = ""
+        if resource_type not in {"xhr", "fetch"}:
+            return
+        try:
+            payload = response.json()
+        except Exception:
+            return
+        parsed_rows = parse_reviews_from_payload(
+            payload,
+            product_url=product_url,
+            review_page=len(payload_pages) + 1,
+            source_url=getattr(response, "url", product_url),
+        )
+        if not parsed_rows:
+            return
+        payload_pages.append(
+            {
+                "page_no": len(payload_pages) + 1,
+                "source_url": getattr(response, "url", product_url),
+                "payload": payload,
+                "rows": parsed_rows,
+            }
+        )
+        artifacts.append(
+            {
+                "kind": "payload_json",
+                "page_no": str(len(payload_pages)),
+                "source_url": getattr(response, "url", product_url),
+                "content": payload,
+            }
+        )
+        rows.extend(parsed_rows)
+
+    try:
+        playwright = sync_playwright().start()
+        browser = playwright.chromium.launch(headless=bool(config.get("browser_headless", True)))
+        context = browser.new_context(
+            user_agent=str(config.get("user_agent") or ""),
+            locale="id-ID",
+        )
+        page = context.new_page()
+        page.on("response", maybe_capture_payload)
+        timeout_ms = int(float(config.get("browser_timeout_s", 30)) * 1000)
+        page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        page.wait_for_timeout(1500)
+
+        for selector in (
+            "text=Penilaian Produk",
+            "text=Ulasan",
+            "text=Ratings",
+            "[href*='rating']",
+            "[href*='review']",
+        ):
+            try:
+                page.locator(selector).first.click(timeout=2000)
+                page.wait_for_timeout(1200)
+                break
+            except Exception:
+                continue
+
+        for _ in range(max(max_pages, 1)):
+            page.mouse.wheel(0, 2500)
+            page.wait_for_timeout(800)
+
+        rendered_html = page.content()
+        artifacts.append(
+            {
+                "kind": "rendered_html",
+                "page_no": "1",
+                "source_url": page.url,
+                "content": rendered_html,
+            }
+        )
+
+        if not rows:
+            dom_rows = parse_reviews_from_rendered_html(
+                rendered_html,
+                product_url=product_url,
+                source_url=page.url,
+            )
+            rows.extend(dom_rows)
+
+        return BrowserReviewFallbackResult(
+            rows=rows,
+            payload_pages=payload_pages[:max_pages],
+            artifacts=artifacts,
+        )
+    except PlaywrightTimeoutError as exc:
+        return BrowserReviewFallbackResult(
+            rows=[],
+            payload_pages=[],
+            artifacts=artifacts,
+            error=f"playwright_timeout: {exc}",
+        )
+    except Exception as exc:  # pragma: no cover - defensive around browser runtime
+        return BrowserReviewFallbackResult(
+            rows=[],
+            payload_pages=[],
+            artifacts=artifacts,
+            error=f"browser_fallback_error: {exc}",
+        )
+    finally:
+        if browser is not None:
+            browser.close()
+        if playwright is not None:
+            playwright.stop()
