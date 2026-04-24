@@ -1,4 +1,10 @@
+.uv-cache/
+.venv/
+
 **/__pycache__
+
+data/
 
 References/
 *.pdf
+*.html
