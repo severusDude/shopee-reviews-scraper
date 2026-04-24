@@ -19,6 +19,7 @@ Core code lives in `src/` as flat modules:
 - `parser.py`: HTML snapshot parsing and review extraction
 - `pipeline.py`: end-to-end crawl, clean, validate, feature workflow
 - `safe_http.py`: HTTP fetch, block detection, file/text/json helpers
+- `workflow_logging.py`: shared text logging, JSONL events, and notebook/terminal progress bars
 
 Important:
 - `src/http.py` was renamed to `src/safe_http.py`
@@ -43,9 +44,11 @@ Notebook sequence:
 3. `02_product_snapshot.ipynb`
    - fetch product pages
    - write raw HTML and product snapshots
+   - show live `tqdm` progress in notebook runs
 4. `03_review_harvest.ipynb`
    - discover review pages
    - fetch and parse review rows
+   - show live `tqdm` progress in notebook runs
 5. `04_clean_validate.ipynb`
    - clean raw products and reviews
    - write parquet + CSV fallback
@@ -57,7 +60,7 @@ Pipeline outputs:
 - `data/raw/`: raw HTML
 - `data/interim/`: raw CSV snapshots
 - `data/processed/`: cleaned tables and feature tables
-- `logs/`: crawl manifests and summaries
+- `logs/`: crawl manifests, summaries, human-readable `.log` files, and structured `*_events.jsonl` files
 
 ## Safety Rules
 
@@ -67,6 +70,7 @@ Pipeline outputs:
 - no captcha solving
 - stop on `403`, `429`, login, captcha, forbidden, access denied
 - keep request rate low
+- notebook-first runs should prefer config-driven progress/logging over ad hoc `print`
 
 ## Tests
 
@@ -76,6 +80,17 @@ They cover:
 - feature logic
 - block detection
 - parser behavior
+
+## Useful Commands
+
+- `uv sync`: install or refresh project dependencies
+- `uv run python -m unittest discover -s tests`: run the test suite
+- `uv run jupyter lab`: open the notebook workflow locally
+- `uv run python main.py`: run the project entrypoint
+- `uv run python -c "from pipeline import snapshot_seed_products; print('ok')"`: quick import smoke test
+- `uv run python -m ipykernel install --user --name shopee-reviews-scraper`: register the notebook kernel
+- `uv add <package>`: add a new dependency to the project
+- `uv lock`: refresh the lockfile after dependency changes
 
 ## Editing Rules
 
