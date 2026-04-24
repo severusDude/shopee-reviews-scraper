@@ -4,8 +4,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from shopee_safe_scraper.http import detect_block_condition, inspect_block_condition
-from shopee_safe_scraper.parser import parse_product_snapshot
+from safe_http import detect_block_condition, inspect_block_condition
+from parser import parse_product_snapshot
 
 
 class BlockDetectionTests(unittest.TestCase):

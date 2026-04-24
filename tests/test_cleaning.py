@@ -6,7 +6,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from shopee_safe_scraper.cleaning import clean_reviews_df, mask_identifier, normalize_text
+from cleaning import clean_reviews_df, mask_identifier, normalize_text
 
 
 class CleaningTests(unittest.TestCase):

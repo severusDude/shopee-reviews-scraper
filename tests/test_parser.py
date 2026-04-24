@@ -7,9 +7,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from shopee_safe_scraper.config import DEFAULT_CONFIG, save_config
-from shopee_safe_scraper.parser import discover_review_links, parse_product_snapshot, parse_reviews_from_html
-from shopee_safe_scraper.pipeline import ensure_project_layout, snapshot_seed_products
+from config import DEFAULT_CONFIG, save_config
+from parser import discover_review_links, parse_product_snapshot, parse_reviews_from_html
+from pipeline import ensure_project_layout, snapshot_seed_products
 
 
 SAMPLE_HTML = """

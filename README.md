@@ -14,7 +14,7 @@ Jupyter-first scaffold for collecting a small, public-only Shopee review corpus 
 
 - `config.yaml`: crawl configuration stored as JSON-compatible YAML
 - `notebooks/`: `00` through `05` workflow notebooks
-- `src/shopee_safe_scraper/`: reusable helpers
+- `src/`: reusable helpers
 - `tests/`: lightweight unit tests on parsing, cleaning, and feature logic
 - `data/`: raw, interim, processed artifacts created by notebooks
 - `logs/`: crawl logs and manifest rows

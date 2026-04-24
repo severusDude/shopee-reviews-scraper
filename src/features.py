@@ -5,7 +5,7 @@ from typing import Any
 
 import pandas as pd
 
-from .cleaning import normalize_text
+from cleaning import normalize_text
 
 
 EMOJI_RE = re.compile(

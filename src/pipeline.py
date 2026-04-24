@@ -7,11 +7,11 @@ from typing import Any
 
 import pandas as pd
 
-from .cleaning import clean_products_df, clean_reviews_df, export_dataframe
-from .config import load_config
-from .http import SafeCrawler, append_jsonl, inspect_block_condition, save_text, write_json
-from .parser import discover_review_links, parse_product_snapshot, parse_reviews_from_html, utcnow_iso
-from .features import build_product_aggregates, build_review_features
+from cleaning import clean_products_df, clean_reviews_df, export_dataframe
+from config import load_config
+from safe_http import SafeCrawler, append_jsonl, inspect_block_condition, save_text, write_json
+from parser import discover_review_links, parse_product_snapshot, parse_reviews_from_html, utcnow_iso
+from features import build_product_aggregates, build_review_features
 
 
 @dataclass

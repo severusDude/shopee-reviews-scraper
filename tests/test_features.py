@@ -6,7 +6,7 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from shopee_safe_scraper.features import build_product_aggregates, build_review_features
+from features import build_product_aggregates, build_review_features
 
 
 class FeatureTests(unittest.TestCase):

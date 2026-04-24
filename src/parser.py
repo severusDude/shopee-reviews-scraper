@@ -394,7 +394,7 @@ def discover_review_links(html: str, base_url: str, max_pages: int = 10) -> list
             unique.append(href)
             seen.add(href)
     resolved = []
-    from .http import absolutize_links
+    from safe_http import absolutize_links
 
     for link in absolutize_links(base_url, unique)[:max_pages]:
         resolved.append(link)
