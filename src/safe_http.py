@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import random
 import re
+import subprocess
+import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+import traceback
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin
@@ -52,8 +54,19 @@ class FetchResult:
 class BrowserReviewFallbackResult:
     rows: list[dict[str, Any]]
     payload_pages: list[dict[str, Any]]
-    artifacts: list[dict[str, str]]
-    error: str | None = None
+    artifacts: list[dict[str, Any]]
+    error_code: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+    error_repr: str | None = None
+    error_traceback: str | None = None
+
+    @property
+    def error(self) -> str | None:
+        if not any((self.error_code, self.error_type, self.error_message)):
+            return None
+        parts = [part for part in (self.error_code, self.error_type, self.error_message) if part]
+        return ": ".join(parts)
 
 
 def _extract_title(text: str) -> str:
@@ -264,143 +277,165 @@ def absolutize_links(base_url: str, links: list[str]) -> list[str]:
     return deduped
 
 
+def _truncate_text(text: str | None, limit: int = 4000) -> str | None:
+    if text is None:
+        return None
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...<truncated>"
+
+
+def _browser_error_result(
+    *,
+    error_code: str,
+    exc: Exception | None = None,
+    artifacts: list[dict[str, Any]] | None = None,
+    error_message: str | None = None,
+) -> BrowserReviewFallbackResult:
+    exc_type = type(exc).__name__ if exc is not None else None
+    exc_message = error_message if error_message is not None else (str(exc) if exc is not None else None)
+    exc_repr = repr(exc) if exc is not None else None
+    tb_text = None
+    if exc is not None:
+        tb_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    artifacts = list(artifacts or [])
+    if any((error_code, exc_type, exc_message, exc_repr, tb_text)):
+        artifacts.append(
+            {
+                "kind": "diagnostic_json",
+                "page_no": "0",
+                "source_url": "",
+                "content": {
+                    "error_code": error_code,
+                    "error_type": exc_type,
+                    "error_message": exc_message,
+                    "error_repr": exc_repr,
+                    "error_traceback": _truncate_text(tb_text),
+                },
+            }
+        )
+    return BrowserReviewFallbackResult(
+        rows=[],
+        payload_pages=[],
+        artifacts=artifacts,
+        error_code=error_code,
+        error_type=exc_type,
+        error_message=exc_message,
+        error_repr=exc_repr,
+        error_traceback=_truncate_text(tb_text),
+    )
+
+
+def _classify_browser_exception(exc: Exception, phase: str) -> str:
+    message = str(exc or "").lower()
+    if isinstance(exc, ImportError):
+        return "playwright_import_error"
+    if isinstance(exc, PermissionError):
+        return "playwright_permission_denied"
+    if "inside the asyncio loop" in message:
+        return "playwright_event_loop_conflict"
+    if "executable doesn't exist" in message or "browserType.launch" in message and "executable" in message:
+        return "playwright_browser_missing"
+    if "timeout" in message:
+        return "playwright_navigation_timeout" if phase == "navigation" else "playwright_startup_failed"
+    return "playwright_startup_failed" if phase == "startup" else "browser_fallback_error"
+
+
 def fetch_reviews_with_browser_fallback(
     *,
     product_url: str,
     config: dict[str, Any],
     max_pages: int,
 ) -> BrowserReviewFallbackResult:
-    def _run() -> BrowserReviewFallbackResult:
-        from parser import parse_reviews_from_payload, parse_reviews_from_rendered_html
+    request_payload = {
+        "product_url": product_url,
+        "config": {
+            "browser_headless": bool(config.get("browser_headless", True)),
+            "browser_startup_probe_timeout_s": float(config.get("browser_startup_probe_timeout_s", 10)),
+            "browser_timeout_s": float(config.get("browser_timeout_s", 30)),
+            "user_agent": str(config.get("user_agent") or ""),
+        },
+        "max_pages": max_pages,
+    }
+    helper_path = Path(__file__).with_name("browser_runner.py")
+    command = [sys.executable, str(helper_path)]
+    timeout_s = max(
+        float(config.get("browser_timeout_s", 30)) + float(config.get("browser_startup_probe_timeout_s", 10)) + 15.0,
+        30.0,
+    )
 
-        try:
-            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-            from playwright.sync_api import sync_playwright
-        except ImportError as exc:  # pragma: no cover - depends on optional dependency
-            return BrowserReviewFallbackResult(
-                rows=[],
-                payload_pages=[],
-                artifacts=[],
-                error=f"playwright_import_error: {exc}",
-            )
+    try:
+        result = subprocess.run(
+            command,
+            input=json.dumps(request_payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_s,
+            cwd=str(Path(__file__).resolve().parents[1]),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _browser_error_result(error_code="playwright_navigation_timeout", exc=exc)
+    except Exception as exc:  # pragma: no cover - defensive around process launch
+        return _browser_error_result(error_code="playwright_process_failed", exc=exc)
 
-        rows: list[dict[str, Any]] = []
-        payload_pages: list[dict[str, Any]] = []
-        artifacts: list[dict[str, str]] = []
-        browser = None
-        playwright = None
-
-        def maybe_capture_payload(response: Any) -> None:
-            resource_type = ""
-            try:
-                resource_type = response.request.resource_type
-            except Exception:
-                resource_type = ""
-            if resource_type not in {"xhr", "fetch"}:
-                return
-            try:
-                payload = response.json()
-            except Exception:
-                return
-            parsed_rows = parse_reviews_from_payload(
-                payload,
-                product_url=product_url,
-                review_page=len(payload_pages) + 1,
-                source_url=getattr(response, "url", product_url),
-            )
-            if not parsed_rows:
-                return
-            payload_pages.append(
+    stdout_text = (result.stdout or "").strip()
+    stderr_text = (result.stderr or "").strip()
+    if result.returncode != 0:
+        return BrowserReviewFallbackResult(
+            rows=[],
+            payload_pages=[],
+            artifacts=[
                 {
-                    "page_no": len(payload_pages) + 1,
-                    "source_url": getattr(response, "url", product_url),
-                    "payload": payload,
-                    "rows": parsed_rows,
+                    "kind": "diagnostic_json",
+                    "page_no": "0",
+                    "source_url": "",
+                    "content": {
+                        "command": command,
+                        "returncode": result.returncode,
+                        "stdout": _truncate_text(stdout_text),
+                        "stderr": _truncate_text(stderr_text),
+                    },
                 }
-            )
-            artifacts.append(
+            ],
+            error_code="playwright_process_failed",
+            error_type="CalledProcessError",
+            error_message=f"helper exited with code {result.returncode}",
+            error_repr=f"CalledProcessError(returncode={result.returncode})",
+            error_traceback=_truncate_text(stderr_text),
+        )
+
+    try:
+        payload = json.loads(stdout_text)
+    except json.JSONDecodeError as exc:
+        return BrowserReviewFallbackResult(
+            rows=[],
+            payload_pages=[],
+            artifacts=[
                 {
-                    "kind": "payload_json",
-                    "page_no": str(len(payload_pages)),
-                    "source_url": getattr(response, "url", product_url),
-                    "content": payload,
+                    "kind": "diagnostic_json",
+                    "page_no": "0",
+                    "source_url": "",
+                    "content": {
+                        "stdout": _truncate_text(stdout_text),
+                        "stderr": _truncate_text(stderr_text),
+                    },
                 }
-            )
-            rows.extend(parsed_rows)
+            ],
+            error_code="playwright_process_output_invalid",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            error_repr=repr(exc),
+            error_traceback=_truncate_text(stderr_text),
+        )
 
-        try:
-            playwright = sync_playwright().start()
-            browser = playwright.chromium.launch(headless=bool(config.get("browser_headless", True)))
-            context = browser.new_context(
-                user_agent=str(config.get("user_agent") or ""),
-                locale="id-ID",
-            )
-            page = context.new_page()
-            page.on("response", maybe_capture_payload)
-            timeout_ms = int(float(config.get("browser_timeout_s", 30)) * 1000)
-            page.goto(product_url, wait_until="domcontentloaded", timeout=timeout_ms)
-            page.wait_for_timeout(1500)
-
-            for selector in (
-                "text=Penilaian Produk",
-                "text=Ulasan",
-                "text=Ratings",
-                "[href*='rating']",
-                "[href*='review']",
-            ):
-                try:
-                    page.locator(selector).first.click(timeout=2000)
-                    page.wait_for_timeout(1200)
-                    break
-                except Exception:
-                    continue
-
-            for _ in range(max(max_pages, 1)):
-                page.mouse.wheel(0, 2500)
-                page.wait_for_timeout(800)
-
-            rendered_html = page.content()
-            artifacts.append(
-                {
-                    "kind": "rendered_html",
-                    "page_no": "1",
-                    "source_url": page.url,
-                    "content": rendered_html,
-                }
-            )
-
-            if not rows:
-                dom_rows = parse_reviews_from_rendered_html(
-                    rendered_html,
-                    product_url=product_url,
-                    source_url=page.url,
-                )
-                rows.extend(dom_rows)
-
-            return BrowserReviewFallbackResult(
-                rows=rows,
-                payload_pages=payload_pages[:max_pages],
-                artifacts=artifacts,
-            )
-        except PlaywrightTimeoutError as exc:
-            return BrowserReviewFallbackResult(
-                rows=[],
-                payload_pages=[],
-                artifacts=artifacts,
-                error=f"playwright_timeout: {exc}",
-            )
-        except Exception as exc:  # pragma: no cover - defensive around browser runtime
-            return BrowserReviewFallbackResult(
-                rows=[],
-                payload_pages=[],
-                artifacts=artifacts,
-                error=f"browser_fallback_error: {exc}",
-            )
-        finally:
-            if browser is not None:
-                browser.close()
-            if playwright is not None:
-                playwright.stop()
-
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="browser-fallback") as executor:
-        return executor.submit(_run).result()
+    return BrowserReviewFallbackResult(
+        rows=list(payload.get("rows") or []),
+        payload_pages=list(payload.get("payload_pages") or []),
+        artifacts=list(payload.get("artifacts") or []),
+        error_code=payload.get("error_code"),
+        error_type=payload.get("error_type"),
+        error_message=payload.get("error_message"),
+        error_repr=payload.get("error_repr"),
+        error_traceback=payload.get("error_traceback"),
+    )

@@ -58,9 +58,9 @@ def _save_browser_artifact(paths: dict[str, Path], product_idx: int, artifact_id
     kind = str(artifact.get("kind") or "artifact")
     page_no = str(artifact.get("page_no") or "1")
     source_url = str(artifact.get("source_url") or "")
-    if kind == "payload_json":
+    if kind in {"payload_json", "diagnostic_json"}:
         write_json(
-            paths["raw_html"] / f"review_page_{product_idx + 1:03d}_{int(page_no):03d}_browser_payload.json",
+            paths["raw_html"] / f"review_page_{product_idx + 1:03d}_{int(page_no):03d}_browser_{kind}.json",
             {
                 "source_url": source_url,
                 "payload": artifact.get("content"),
@@ -290,6 +290,7 @@ def harvest_reviews(
         rows: list[dict[str, Any]] = []
         product_review_counts: dict[str, int] = {}
         stop_reason: str | None = None
+        browser_runtime_failure: dict[str, Any] | None = None
 
         for product_idx, seed in _progress_iter(
             logger,
@@ -399,12 +400,26 @@ def harvest_reviews(
                     source_url=product_url,
                     max_pages=max_pages_per_product,
                 )
-                browser_result = fetch_reviews_with_browser_fallback(
-                    product_url=product_url,
-                    config=config,
-                    max_pages=max_pages_per_product,
-                )
-                if browser_result.error:
+                if browser_runtime_failure is not None:
+                    _log_event(
+                        logger,
+                        "warning",
+                        "review_harvest",
+                        "browser_runtime_unavailable",
+                        product_index=product_idx + 1,
+                        source_url=product_url,
+                        error_code=browser_runtime_failure.get("error_code"),
+                        error_type=browser_runtime_failure.get("error_type"),
+                        error_message=browser_runtime_failure.get("error_message"),
+                    )
+                    browser_result = None
+                else:
+                    browser_result = fetch_reviews_with_browser_fallback(
+                        product_url=product_url,
+                        config=config,
+                        max_pages=max_pages_per_product,
+                    )
+                if browser_result is not None and browser_result.error:
                     _log_event(
                         logger,
                         "warning",
@@ -412,9 +427,27 @@ def harvest_reviews(
                         "browser_fallback_failed",
                         product_index=product_idx + 1,
                         source_url=product_url,
+                        error_code=browser_result.error_code,
+                        error_type=browser_result.error_type,
+                        error_message=browser_result.error_message,
+                        error_repr=browser_result.error_repr,
                         error=browser_result.error,
                     )
-                else:
+                    for artifact_idx, artifact in enumerate(browser_result.artifacts, start=1):
+                        _save_browser_artifact(paths, product_idx, artifact_idx, artifact)
+                    if browser_result.error_code in {
+                        "playwright_import_error",
+                        "playwright_startup_failed",
+                        "playwright_event_loop_conflict",
+                        "playwright_permission_denied",
+                        "playwright_browser_missing",
+                    }:
+                        browser_runtime_failure = {
+                            "error_code": browser_result.error_code,
+                            "error_type": browser_result.error_type,
+                            "error_message": browser_result.error_message,
+                        }
+                elif browser_result is not None:
                     for page_info in browser_result.payload_pages:
                         _log_event(
                             logger,

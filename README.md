@@ -49,3 +49,4 @@ Review harvest now includes optional browser fallback for Shopee shell pages. In
 - `uv run playwright install chromium`
 
 Browser fallback still follows public-only rules: no login, no proxy rotation, no captcha solving, no hidden/private endpoint probing.
+On Windows notebook/local runs, Playwright also needs permission to spawn browser subprocesses. If host policy blocks that, logs should report a structured startup failure such as `playwright_permission_denied`.

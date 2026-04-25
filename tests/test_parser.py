@@ -1,9 +1,11 @@
 from pathlib import Path
+import json
 import shutil
 import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import subprocess
 
 import pandas as pd
 
@@ -19,6 +21,7 @@ from parser import (
     parse_reviews_from_rendered_html,
 )
 from pipeline import ensure_project_layout, harvest_reviews, snapshot_seed_products
+from safe_http import BrowserReviewFallbackResult, _classify_browser_exception, fetch_reviews_with_browser_fallback
 
 
 SAMPLE_HTML = """
@@ -191,6 +194,83 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(str(reviews[0]["star_rating"]), "5")
         self.assertTrue(bool(reviews[0]["seller_reply_flag"]))
 
+    def test_classify_browser_exception_maps_permission_denied(self) -> None:
+        exc = PermissionError(13, "Access is denied", None, 5, None)
+        self.assertEqual(_classify_browser_exception(exc, "startup"), "playwright_permission_denied")
+
+    def test_classify_browser_exception_maps_event_loop_conflict(self) -> None:
+        exc = RuntimeError("It looks like you are using Playwright Sync API inside the asyncio loop.")
+        self.assertEqual(_classify_browser_exception(exc, "startup"), "playwright_event_loop_conflict")
+
+    def test_fetch_reviews_with_browser_fallback_parses_helper_json(self) -> None:
+        browser_rows = parse_reviews_from_payload(
+            SAMPLE_PAYLOAD,
+            product_url="https://shopee.co.id/produk-contoh-i.123.456",
+        )
+        completed = subprocess.CompletedProcess(
+            args=["python", "browser_runner.py"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "rows": browser_rows,
+                    "payload_pages": [
+                        {
+                            "page_no": 1,
+                            "source_url": "https://shopee.co.id/api/v4/item/get_ratings",
+                            "payload": SAMPLE_PAYLOAD,
+                            "rows": browser_rows,
+                        }
+                    ],
+                    "artifacts": [],
+                    "error_code": None,
+                    "error_type": None,
+                    "error_message": None,
+                    "error_repr": None,
+                    "error_traceback": None,
+                }
+            ),
+            stderr="",
+        )
+        with patch("safe_http.subprocess.run", return_value=completed):
+            result = fetch_reviews_with_browser_fallback(
+                product_url="https://shopee.co.id/produk-contoh-i.123.456",
+                config=DEFAULT_CONFIG,
+                max_pages=2,
+            )
+        self.assertEqual(len(result.rows), 2)
+        self.assertIsNone(result.error_code)
+
+    def test_fetch_reviews_with_browser_fallback_handles_helper_nonzero_exit(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["python", "browser_runner.py"],
+            returncode=7,
+            stdout="",
+            stderr="boom",
+        )
+        with patch("safe_http.subprocess.run", return_value=completed):
+            result = fetch_reviews_with_browser_fallback(
+                product_url="https://shopee.co.id/produk-contoh-i.123.456",
+                config=DEFAULT_CONFIG,
+                max_pages=2,
+            )
+        self.assertEqual(result.error_code, "playwright_process_failed")
+        self.assertEqual(result.error_type, "CalledProcessError")
+
+    def test_fetch_reviews_with_browser_fallback_handles_invalid_helper_output(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=["python", "browser_runner.py"],
+            returncode=0,
+            stdout="not-json",
+            stderr="",
+        )
+        with patch("safe_http.subprocess.run", return_value=completed):
+            result = fetch_reviews_with_browser_fallback(
+                product_url="https://shopee.co.id/produk-contoh-i.123.456",
+                config=DEFAULT_CONFIG,
+                max_pages=2,
+            )
+        self.assertEqual(result.error_code, "playwright_process_output_invalid")
+
     def test_snapshot_seed_products_fails_fast_when_seed_urls_blank(self) -> None:
         with WorkspaceTempDir() as root:
             ensure_project_layout(root)
@@ -323,30 +403,25 @@ class ParserTests(unittest.TestCase):
             product_url="https://shopee.co.id/produk-contoh-i.123.456",
         )
 
-        browser_result = type(
-            "BrowserResult",
-            (),
-            {
-                "rows": browser_rows,
-                "payload_pages": [
-                    {
-                        "page_no": 1,
-                        "source_url": "https://shopee.co.id/api/v4/item/get_ratings",
-                        "payload": SAMPLE_PAYLOAD,
-                        "rows": browser_rows,
-                    }
-                ],
-                "artifacts": [
-                    {
-                        "kind": "payload_json",
-                        "page_no": "1",
-                        "source_url": "https://shopee.co.id/api/v4/item/get_ratings",
-                        "content": SAMPLE_PAYLOAD,
-                    }
-                ],
-                "error": None,
-            },
-        )()
+        browser_result = BrowserReviewFallbackResult(
+            rows=browser_rows,
+            payload_pages=[
+                {
+                    "page_no": 1,
+                    "source_url": "https://shopee.co.id/api/v4/item/get_ratings",
+                    "payload": SAMPLE_PAYLOAD,
+                    "rows": browser_rows,
+                }
+            ],
+            artifacts=[
+                {
+                    "kind": "payload_json",
+                    "page_no": "1",
+                    "source_url": "https://shopee.co.id/api/v4/item/get_ratings",
+                    "content": SAMPLE_PAYLOAD,
+                }
+            ],
+        )
 
         with WorkspaceTempDir() as root:
             ensure_project_layout(root)
@@ -394,16 +469,15 @@ class ParserTests(unittest.TestCase):
                     },
                 )()
 
-        browser_result = type(
-            "BrowserResult",
-            (),
-            {
-                "rows": [],
-                "payload_pages": [],
-                "artifacts": [],
-                "error": "playwright_import_error: missing",
-            },
-        )()
+        browser_result = BrowserReviewFallbackResult(
+            rows=[],
+            payload_pages=[],
+            artifacts=[],
+            error_code="playwright_import_error",
+            error_type="ModuleNotFoundError",
+            error_message="missing",
+            error_repr="ModuleNotFoundError('missing')",
+        )
 
         with WorkspaceTempDir() as root:
             ensure_project_layout(root)
@@ -426,6 +500,69 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(len(result["reviews"]), 0)
             event_text = Path(result["event_log_path"]).read_text(encoding="utf-8")
             self.assertIn('"event": "browser_fallback_failed"', event_text)
+            self.assertIn('"error_code": "playwright_import_error"', event_text)
+            self.assertIn('"error_type": "ModuleNotFoundError"', event_text)
+
+    def test_harvest_reviews_skips_repeated_browser_startup_failure(self) -> None:
+        class FakeCrawler:
+            def __init__(self, config: dict[str, object], sleep: bool = True):
+                self.config = config
+                self.sleep = sleep
+                self.request_count = 0
+
+            def fetch(self, url: str):
+                self.request_count += 1
+                return type(
+                    "FetchResult",
+                    (),
+                    {
+                        "status_code": 200,
+                        "text": SHELL_HTML,
+                        "final_url": url,
+                        "elapsed_s": 0.1,
+                        "size_bytes": len(SHELL_HTML.encode("utf-8")),
+                        "error": None,
+                    },
+                )()
+
+        browser_result = BrowserReviewFallbackResult(
+            rows=[],
+            payload_pages=[],
+            artifacts=[],
+            error_code="playwright_permission_denied",
+            error_type="PermissionError",
+            error_message="[WinError 5] Access is denied",
+            error_repr="PermissionError(13, 'Access is denied', None, 5, None)",
+        )
+
+        with WorkspaceTempDir() as root:
+            ensure_project_layout(root)
+            save_config(root / "config.yaml", DEFAULT_CONFIG)
+            pd.DataFrame(
+                [
+                    {
+                        "product_url": "https://shopee.co.id/produk-contoh-i.123.456",
+                        "category_quota": "Elektronik",
+                        "chosen_reason": "manual seed slot 1",
+                        "seed_date": "2026-04-24",
+                    },
+                    {
+                        "product_url": "https://shopee.co.id/produk-kedua-i.123.789",
+                        "category_quota": "Elektronik",
+                        "chosen_reason": "manual seed slot 2",
+                        "seed_date": "2026-04-24",
+                    },
+                ]
+            ).to_csv(root / "data" / "interim" / "seed_products.csv", index=False)
+
+            with patch("pipeline.SafeCrawler", FakeCrawler):
+                with patch("pipeline.fetch_reviews_with_browser_fallback", return_value=browser_result) as mock_fallback:
+                    result = harvest_reviews(root, sleep=False, max_pages_per_product=2, verbose=True)
+
+            self.assertEqual(len(result["reviews"]), 0)
+            self.assertEqual(mock_fallback.call_count, 1)
+            event_text = Path(result["event_log_path"]).read_text(encoding="utf-8")
+            self.assertIn('"event": "browser_runtime_unavailable"', event_text)
 
 
 if __name__ == "__main__":

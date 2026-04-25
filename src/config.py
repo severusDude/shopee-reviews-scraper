@@ -27,7 +27,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "browser_fallback_enabled": True,
     "browser_engine": "chromium",
     "browser_timeout_s": 30,
+    "browser_startup_probe_timeout_s": 10,
     "browser_headless": True,
+    "browser_diagnostics_verbose": True,
     "stop_on_status": [403, 429],
     "stop_on_keywords": [
         "captcha",
