@@ -1,5 +1,7 @@
 # AGENT.md
 
+**READ PROGRAM_PIPELINE.md first for understanding the program pipeline**
+
 ## Project
 
 Shopee review research pipeline.
