@@ -435,6 +435,21 @@ def harvest_reviews(
                     )
                     for artifact_idx, artifact in enumerate(browser_result.artifacts, start=1):
                         _save_browser_artifact(paths, product_idx, artifact_idx, artifact)
+                    if str(browser_result.error_code or "").startswith("browser_blocked_"):
+                        stop_reason = str(browser_result.error_code)
+                        _log_event(
+                            logger,
+                            "stop_condition",
+                            "review_harvest",
+                            product_index=product_idx + 1,
+                            page_no=1,
+                            source_url=product_url,
+                            stop_reason=stop_reason,
+                            signal_class="browser_rendered_page",
+                            signal_source="browser_fallback",
+                            matched_text=browser_result.error_message,
+                        )
+                        break
                     if browser_result.error_code in {
                         "playwright_import_error",
                         "playwright_startup_failed",

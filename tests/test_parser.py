@@ -507,6 +507,67 @@ class ParserTests(unittest.TestCase):
             self.assertIn('"error_code": "playwright_import_error"', event_text)
             self.assertIn('"error_type": "ModuleNotFoundError"', event_text)
 
+    def test_harvest_reviews_stops_on_browser_rendered_block(self) -> None:
+        class FakeCrawler:
+            def __init__(self, config: dict[str, object], sleep: bool = True):
+                self.config = config
+                self.sleep = sleep
+                self.request_count = 0
+
+            def fetch(self, url: str):
+                self.request_count += 1
+                return type(
+                    "FetchResult",
+                    (),
+                    {
+                        "status_code": 200,
+                        "text": SHELL_HTML,
+                        "final_url": url,
+                        "elapsed_s": 0.1,
+                        "size_bytes": len(SHELL_HTML.encode("utf-8")),
+                        "error": None,
+                    },
+                )()
+
+        browser_result = BrowserReviewFallbackResult(
+            rows=[],
+            payload_pages=[],
+            artifacts=[
+                {
+                    "kind": "rendered_html",
+                    "page_no": "1",
+                    "source_url": "https://shopee.co.id/produk-contoh-i.123.456",
+                    "content": "Halaman Tidak Tersedia. Log In.",
+                }
+            ],
+            error_code="browser_blocked_login",
+            error_message="rendered page matched block marker: log in",
+        )
+
+        with WorkspaceTempDir() as root:
+            ensure_project_layout(root)
+            save_config(root / "config.yaml", DEFAULT_CONFIG)
+            pd.DataFrame(
+                [
+                    {
+                        "product_url": "https://shopee.co.id/produk-contoh-i.123.456",
+                        "category_quota": "Elektronik",
+                        "chosen_reason": "manual seed slot 1",
+                        "seed_date": "2026-04-24",
+                    }
+                ]
+            ).to_csv(root / "data" / "interim" / "seed_products.csv", index=False)
+
+            with patch("pipeline.SafeCrawler", FakeCrawler):
+                with patch("pipeline.fetch_reviews_with_browser_fallback", return_value=browser_result):
+                    result = harvest_reviews(root, sleep=False, max_pages_per_product=2, verbose=True)
+
+            self.assertEqual(result["summary"]["stop_reason"], "browser_blocked_login")
+            event_text = Path(result["event_log_path"]).read_text(encoding="utf-8")
+            self.assertIn('"event": "stop_condition"', event_text)
+            self.assertIn('"stop_reason": "browser_blocked_login"', event_text)
+            self.assertIn('"signal_source": "browser_fallback"', event_text)
+
     def test_harvest_reviews_skips_repeated_browser_startup_failure(self) -> None:
         class FakeCrawler:
             def __init__(self, config: dict[str, object], sleep: bool = True):

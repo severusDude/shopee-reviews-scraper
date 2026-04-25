@@ -11,6 +11,14 @@ from typing import Any
 from parser import parse_reviews_from_payload, parse_reviews_from_rendered_html
 
 
+RENDERED_BLOCK_MARKERS = (
+    ("browser_blocked_login", ("login", "log in", "sign in", "belum masuk", "masuk untuk melanjutkan")),
+    ("browser_blocked_unavailable", ("halaman tidak tersedia", "page unavailable", "page not available")),
+    ("browser_blocked_captcha", ("captcha", "verify you are human")),
+    ("browser_blocked_access_denied", ("access denied", "forbidden")),
+)
+
+
 def _configure_windows_event_loop_for_playwright() -> None:
     if sys.platform != "win32":
         return
@@ -29,6 +37,15 @@ def _truncate_text(text: str | None, limit: int = 4000) -> str | None:
     if len(text) <= limit:
         return text
     return text[:limit] + "...<truncated>"
+
+
+def _classify_rendered_block(visible_text: str) -> tuple[str, str] | tuple[None, None]:
+    normalized = " ".join((visible_text or "").lower().split())
+    for error_code, markers in RENDERED_BLOCK_MARKERS:
+        for marker in markers:
+            if marker in normalized:
+                return error_code, marker
+    return None, None
 
 
 def _classify_browser_exception(exc: Exception, phase: str) -> str:
@@ -87,6 +104,11 @@ def _error_payload(
     }
 
 
+def _emit_payload(payload: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True))
+    sys.stdout.write("\n")
+
+
 def _load_request() -> dict[str, Any]:
     return json.loads(sys.stdin.read())
 
@@ -102,7 +124,7 @@ def main() -> int:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
-        print(json.dumps(_error_payload(error_code="playwright_import_error", exc=exc), ensure_ascii=False))
+        _emit_payload(_error_payload(error_code="playwright_import_error", exc=exc))
         return 0
 
     rows: list[dict[str, Any]] = []
@@ -186,6 +208,11 @@ def main() -> int:
             page.mouse.wheel(0, 2500)
             page.wait_for_timeout(800)
 
+        visible_text = ""
+        try:
+            visible_text = page.locator("body").inner_text(timeout=2000)
+        except Exception:
+            visible_text = ""
         rendered_html = page.content()
         artifacts.append(
             {
@@ -195,6 +222,16 @@ def main() -> int:
                 "content": rendered_html,
             }
         )
+        block_error_code, block_marker = _classify_rendered_block(visible_text)
+        if block_error_code:
+            _emit_payload(
+                _error_payload(
+                    error_code=block_error_code,
+                    error_message=f"rendered page matched block marker: {block_marker}",
+                    artifacts=artifacts,
+                )
+            )
+            return 0
 
         if not rows:
             dom_rows = parse_reviews_from_rendered_html(
@@ -204,35 +241,29 @@ def main() -> int:
             )
             rows.extend(dom_rows)
 
-        print(
-            json.dumps(
-                {
-                    "rows": rows,
-                    "payload_pages": payload_pages[:max_pages],
-                    "artifacts": artifacts,
-                    "error_code": None,
-                    "error_type": None,
-                    "error_message": None,
-                    "error_repr": None,
-                    "error_traceback": None,
-                },
-                ensure_ascii=False,
-            )
+        _emit_payload(
+            {
+                "rows": rows,
+                "payload_pages": payload_pages[:max_pages],
+                "artifacts": artifacts,
+                "error_code": None,
+                "error_type": None,
+                "error_message": None,
+                "error_repr": None,
+                "error_traceback": None,
+            }
         )
         return 0
     except PlaywrightTimeoutError as exc:
-        print(json.dumps(_error_payload(error_code="playwright_navigation_timeout", exc=exc, artifacts=artifacts), ensure_ascii=False))
+        _emit_payload(_error_payload(error_code="playwright_navigation_timeout", exc=exc, artifacts=artifacts))
         return 0
     except Exception as exc:
         phase = "startup" if browser is None else "navigation"
-        print(
-            json.dumps(
-                _error_payload(
-                    error_code=_classify_browser_exception(exc, phase),
-                    exc=exc,
-                    artifacts=artifacts,
-                ),
-                ensure_ascii=False,
+        _emit_payload(
+            _error_payload(
+                error_code=_classify_browser_exception(exc, phase),
+                exc=exc,
+                artifacts=artifacts,
             )
         )
         return 0
