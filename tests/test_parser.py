@@ -202,6 +202,10 @@ class ParserTests(unittest.TestCase):
         exc = RuntimeError("It looks like you are using Playwright Sync API inside the asyncio loop.")
         self.assertEqual(_classify_browser_exception(exc, "startup"), "playwright_event_loop_conflict")
 
+    def test_classify_browser_exception_maps_subprocess_loop_conflict(self) -> None:
+        exc = NotImplementedError()
+        self.assertEqual(_classify_browser_exception(exc, "startup"), "playwright_event_loop_conflict")
+
     def test_fetch_reviews_with_browser_fallback_parses_helper_json(self) -> None:
         browser_rows = parse_reviews_from_payload(
             SAMPLE_PAYLOAD,

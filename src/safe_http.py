@@ -332,6 +332,8 @@ def _classify_browser_exception(exc: Exception, phase: str) -> str:
         return "playwright_import_error"
     if isinstance(exc, PermissionError):
         return "playwright_permission_denied"
+    if isinstance(exc, NotImplementedError):
+        return "playwright_event_loop_conflict"
     if "inside the asyncio loop" in message:
         return "playwright_event_loop_conflict"
     if "executable doesn't exist" in message or "browserType.launch" in message and "executable" in message:

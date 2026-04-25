@@ -1,12 +1,26 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import sys
 import traceback
+import warnings
 from pathlib import Path
 from typing import Any
 
 from parser import parse_reviews_from_payload, parse_reviews_from_rendered_html
+
+
+def _configure_windows_event_loop_for_playwright() -> None:
+    if sys.platform != "win32":
+        return
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        policy_factory = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+        if policy_factory is not None:
+            asyncio.set_event_loop_policy(policy_factory())
+    if policy_factory is None:
+        return
 
 
 def _truncate_text(text: str | None, limit: int = 4000) -> str | None:
@@ -21,6 +35,10 @@ def _classify_browser_exception(exc: Exception, phase: str) -> str:
     message = str(exc or "").lower()
     if isinstance(exc, ImportError):
         return "playwright_import_error"
+    if isinstance(exc, PermissionError):
+        return "playwright_permission_denied"
+    if isinstance(exc, NotImplementedError):
+        return "playwright_event_loop_conflict"
     if "executable doesn't exist" in message or ("browsertype.launch" in message and "executable" in message):
         return "playwright_browser_missing"
     if "timeout" in message:
@@ -78,6 +96,7 @@ def main() -> int:
     product_url = str(request["product_url"])
     config = dict(request["config"])
     max_pages = int(request["max_pages"])
+    _configure_windows_event_loop_for_playwright()
 
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
